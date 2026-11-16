@@ -779,84 +779,214 @@ pub fn resolve_rust_receiver_type(
     receiver_name: &str,
     enclosing_impl: Option<&str>,
 ) -> (Option<String>, Confidence) {
-    // 1. Handle "self" or "Self" reference
-    if receiver_name == "self" || receiver_name == "&self" || receiver_name == "&mut self" {
-        if let Some(impl_type) = enclosing_impl {
-            return (Some(impl_type.to_string()), Confidence::High);
-        }
-        if let Some(impl_type) = find_rust_enclosing_impl(source, call_line) {
-            return (Some(impl_type), Confidence::High);
-        }
-        return (None, Confidence::Low);
-    }
-
-    // Handle Self:: calls
-    if receiver_name == "Self" {
-        if let Some(impl_type) = enclosing_impl {
-            return (Some(impl_type.to_string()), Confidence::High);
-        }
-        if let Some(impl_type) = find_rust_enclosing_impl(source, call_line) {
-            return (Some(impl_type), Confidence::High);
-        }
-        return (None, Confidence::Low);
-    }
-
-    // 2. Look for explicit type annotation: `let x: Type = ...`
-    if let Some(type_name) = find_rust_annotation(source, receiver_name, call_line) {
-        return (Some(type_name), Confidence::High);
-    }
-
-    // 3. Look for associated function call: `let x = Type::new()`
-    if let Some(type_name) = find_rust_associated_function(source, receiver_name, call_line) {
-        return (Some(type_name), Confidence::High);
-    }
-
-    // 4. Look for struct literal: `let x = Type { ... }`
-    if let Some(type_name) = find_rust_struct_literal(source, receiver_name, call_line) {
-        return (Some(type_name), Confidence::High);
-    }
-
-    // 5. Fallback - unknown type
-    (None, Confidence::Low)
+    RustSourceIndex::new(source).resolve(call_line, receiver_name, enclosing_impl)
 }
 
-/// Find the Rust impl block containing a given line
-fn find_rust_enclosing_impl(source: &str, line: u32) -> Option<String> {
-    let mut current_impl: Option<(String, i32)> = None; // (type_name, brace_depth when impl started)
-    let mut brace_depth: i32 = 0;
+/// A Rust file indexed once, so that resolving each call site no longer rescans the file.
+///
+/// Resolving every call site against the raw source cost (call sites x lines): `tldr impact`
+/// took about 170 seconds on a crate with a 13,000-line file. Build one index per file and call
+/// [`RustSourceIndex::resolve`] for each call site; the answers match
+/// [`resolve_rust_receiver_type`] exactly.
+pub struct RustSourceIndex<'a> {
+    /// Trimmed lines, as the per-line `let` checks read them.
+    lines: Vec<&'a str>,
+    /// At index n - 1: the impl block enclosing line n, if any.
+    enclosing_impl: Vec<Option<String>>,
+    /// Indices of the lines that contain "let ", ascending.
+    let_lines: Vec<usize>,
+    /// The same lines, under the identifier after each "let " and each "let mut ".
+    let_lines_by_ident: HashMap<&'a str, Vec<usize>>,
+}
 
-    for (line_num, line_content) in source.lines().enumerate() {
-        let current_line = (line_num + 1) as u32;
-        let trimmed = line_content.trim();
+impl<'a> RustSourceIndex<'a> {
+    /// Index `source` in one pass.
+    pub fn new(source: &'a str) -> Self {
+        let mut index = RustSourceIndex {
+            lines: Vec::new(),
+            enclosing_impl: Vec::new(),
+            let_lines: Vec::new(),
+            let_lines_by_ident: HashMap::new(),
+        };
+        // (type_name, brace_depth when the impl started)
+        let mut current_impl: Option<(String, i32)> = None;
+        let mut brace_depth: i32 = 0;
 
-        // Update brace depth
-        brace_depth += line_content.matches('{').count() as i32;
-        brace_depth -= line_content.matches('}').count() as i32;
+        for (i, raw) in source.lines().enumerate() {
+            let trimmed = raw.trim();
 
-        // Check for impl block
-        if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
-            if let Some(impl_type) = extract_rust_impl_type(trimmed) {
-                current_impl = Some((impl_type, brace_depth));
+            brace_depth += raw.matches('{').count() as i32;
+            brace_depth -= raw.matches('}').count() as i32;
+            if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+                if let Some(impl_type) = extract_rust_impl_type(trimmed) {
+                    current_impl = Some((impl_type, brace_depth));
+                }
+            }
+            index.enclosing_impl.push(match &current_impl {
+                Some((impl_type, start_depth)) if brace_depth >= *start_depth => {
+                    Some(impl_type.clone())
+                }
+                _ => None,
+            });
+            if let Some((_, start_depth)) = &current_impl {
+                if brace_depth < *start_depth {
+                    current_impl = None;
+                }
+            }
+
+            index.lines.push(trimmed);
+            let mut has_let = false;
+            for (at, _) in trimmed.match_indices("let ") {
+                has_let = true;
+                let rest = &trimmed[at + 4..];
+                index.add_let_line(leading_ident(rest), i);
+                if let Some(after_mut) = rest.strip_prefix("mut ") {
+                    index.add_let_line(leading_ident(after_mut), i);
+                }
+            }
+            if has_let {
+                index.let_lines.push(i);
+            }
+        }
+        index
+    }
+
+    fn add_let_line(&mut self, ident: &'a str, line: usize) {
+        let bucket = self.let_lines_by_ident.entry(ident).or_default();
+        if bucket.last() != Some(&line) {
+            bucket.push(line);
+        }
+    }
+
+    /// Resolve the receiver of a method call on `call_line` (1-indexed).
+    pub fn resolve(
+        &self,
+        call_line: u32,
+        receiver_name: &str,
+        enclosing_impl: Option<&str>,
+    ) -> (Option<String>, Confidence) {
+        // 1. "self" and "Self" resolve to the enclosing impl
+        if matches!(receiver_name, "self" | "&self" | "&mut self" | "Self") {
+            if let Some(impl_type) = enclosing_impl {
+                return (Some(impl_type.to_string()), Confidence::High);
+            }
+            if let Some(impl_type) = self.impl_at(call_line) {
+                return (Some(impl_type), Confidence::High);
+            }
+            return (None, Confidence::Low);
+        }
+
+        // 2. `let x: Type = ...`, 3. `let x = Type::new()`, 4. `let x = Type { ... }`
+        let checks: [fn(&str, &str) -> Option<String>; 3] = [
+            rust_annotation_in_line,
+            rust_associated_function_in_line,
+            rust_struct_literal_in_line,
+        ];
+        for check in checks {
+            if let Some(type_name) = self.scan_back(call_line, receiver_name, check) {
+                return (Some(type_name), Confidence::High);
             }
         }
 
-        // If we're at the target line
-        if current_line == line {
-            if let Some((ref impl_type, start_depth)) = current_impl {
-                if brace_depth >= start_depth {
-                    return Some(impl_type.clone());
+        // 5. Fallback - unknown type
+        (None, Confidence::Low)
+    }
+
+    fn impl_at(&self, line: u32) -> Option<String> {
+        let i = (line as usize).checked_sub(1)?;
+        self.enclosing_impl.get(i).cloned().flatten()
+    }
+
+    /// The first match of `check` on the lines before `call_line`, nearest first.
+    ///
+    /// Only a line with a "let " whose identifier matches the receiver's can match, so only
+    /// those lines are checked. A call line past the end of the file finds nothing.
+    fn scan_back(
+        &self,
+        call_line: u32,
+        var_name: &str,
+        check: fn(&str, &str) -> Option<String>,
+    ) -> Option<String> {
+        let end = call_line as usize;
+        if end > self.lines.len() {
+            return None;
+        }
+        let ident = leading_ident(var_name);
+        let candidates: &[usize] = if ident.is_empty() {
+            &self.let_lines
+        } else {
+            self.let_lines_by_ident
+                .get(ident)
+                .map_or(&[], |lines| lines.as_slice())
+        };
+        let before = candidates.partition_point(|&i| i < end);
+        candidates[..before]
+            .iter()
+            .rev()
+            .find_map(|&i| check(self.lines[i], var_name))
+    }
+}
+
+/// The identifier characters at the start of `s`.
+fn leading_ident(s: &str) -> &str {
+    let end = s
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// `let name: Type = ...` or `let mut name: Type = ...` on one trimmed line.
+fn rust_annotation_in_line(line: &str, var_name: &str) -> Option<String> {
+    for prefix in &["let ", "let mut "] {
+        let pattern = format!("{}{}: ", prefix, var_name);
+        if let Some(idx) = line.find(&pattern) {
+            let after_colon = &line[idx + pattern.len()..];
+            if let Some(type_name) = extract_rust_type_from_annotation(after_colon) {
+                return Some(type_name);
+            }
+        }
+    }
+    None
+}
+
+/// `let name = Type::...` or `let mut name = Type::...` on one trimmed line.
+fn rust_associated_function_in_line(line: &str, var_name: &str) -> Option<String> {
+    for prefix in &["let ", "let mut "] {
+        let pattern = format!("{}{} = ", prefix, var_name);
+        if let Some(idx) = line.find(&pattern) {
+            let after_eq = &line[idx + pattern.len()..];
+            if let Some(colon_idx) = after_eq.find("::") {
+                let type_name = after_eq[..colon_idx].trim();
+                if !type_name.is_empty()
+                    && type_name.chars().next()?.is_uppercase()
+                    && type_name != "Self"
+                {
+                    return Some(type_name.to_string());
                 }
             }
         }
+    }
+    None
+}
 
-        // Check if we've exited the impl block
-        if let Some((_, start_depth)) = &current_impl {
-            if brace_depth < *start_depth {
-                current_impl = None;
+/// `let name = Type {` or `let mut name = Type {` on one trimmed line.
+fn rust_struct_literal_in_line(line: &str, var_name: &str) -> Option<String> {
+    for prefix in &["let ", "let mut "] {
+        let pattern = format!("{}{} = ", prefix, var_name);
+        if let Some(idx) = line.find(&pattern) {
+            let after_eq = &line[idx + pattern.len()..];
+            if let Some(brace_idx) = after_eq.find('{') {
+                let type_name = after_eq[..brace_idx].trim();
+                if !type_name.is_empty()
+                    && type_name.chars().next()?.is_uppercase()
+                    && !type_name.contains("::")
+                {
+                    return Some(type_name.to_string());
+                }
             }
         }
     }
-
     None
 }
 
@@ -916,28 +1046,6 @@ fn extract_rust_type_name(s: &str) -> Option<String> {
     }
 }
 
-/// Find Rust type annotation for a variable
-fn find_rust_annotation(source: &str, var_name: &str, call_line: u32) -> Option<String> {
-    let lines: Vec<&str> = source.lines().collect();
-
-    for line_num in (0..call_line as usize).rev() {
-        let line = lines.get(line_num)?.trim();
-
-        // Pattern: `let name: Type = ...` or `let mut name: Type = ...`
-        for prefix in &["let ", "let mut "] {
-            let pattern = format!("{}{}: ", prefix, var_name);
-            if let Some(idx) = line.find(&pattern) {
-                let after_colon = &line[idx + pattern.len()..];
-                if let Some(type_name) = extract_rust_type_from_annotation(after_colon) {
-                    return Some(type_name);
-                }
-            }
-        }
-    }
-
-    None
-}
-
 /// Extract type from Rust annotation
 fn extract_rust_type_from_annotation(s: &str) -> Option<String> {
     let trimmed = s.trim();
@@ -967,64 +1075,6 @@ fn extract_rust_type_from_annotation(s: &str) -> Option<String> {
     } else {
         Some(type_name.to_string())
     }
-}
-
-/// Find Rust associated function call: `let x = Type::new()`
-fn find_rust_associated_function(source: &str, var_name: &str, call_line: u32) -> Option<String> {
-    let lines: Vec<&str> = source.lines().collect();
-
-    for line_num in (0..call_line as usize).rev() {
-        let line = lines.get(line_num)?.trim();
-
-        // Pattern: `let name = Type::` or `let mut name = Type::`
-        for prefix in &["let ", "let mut "] {
-            let pattern = format!("{}{} = ", prefix, var_name);
-            if let Some(idx) = line.find(&pattern) {
-                let after_eq = &line[idx + pattern.len()..];
-                // Look for Type::method pattern
-                if let Some(colon_idx) = after_eq.find("::") {
-                    let type_name = after_eq[..colon_idx].trim();
-                    if !type_name.is_empty()
-                        && type_name.chars().next()?.is_uppercase()
-                        && type_name != "Self"
-                    {
-                        return Some(type_name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Find Rust struct literal: `let x = Type { ... }`
-fn find_rust_struct_literal(source: &str, var_name: &str, call_line: u32) -> Option<String> {
-    let lines: Vec<&str> = source.lines().collect();
-
-    for line_num in (0..call_line as usize).rev() {
-        let line = lines.get(line_num)?.trim();
-
-        // Pattern: `let name = Type {` or `let mut name = Type {`
-        for prefix in &["let ", "let mut "] {
-            let pattern = format!("{}{} = ", prefix, var_name);
-            if let Some(idx) = line.find(&pattern) {
-                let after_eq = &line[idx + pattern.len()..];
-                // Look for Type { pattern
-                if let Some(brace_idx) = after_eq.find('{') {
-                    let type_name = after_eq[..brace_idx].trim();
-                    if !type_name.is_empty()
-                        && type_name.chars().next()?.is_uppercase()
-                        && !type_name.contains("::")
-                    {
-                        return Some(type_name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 // =============================================================================
@@ -1989,5 +2039,146 @@ end
             format!("{}", SkipReason::IoError("test".to_string())),
             "IO error: test"
         );
+    }
+
+    // =========================================================================
+    // RustSourceIndex must answer exactly as the per-call scan it replaced
+    // =========================================================================
+
+    /// The resolver as it was before the index: every helper rescans the source.
+    fn naive_rust_receiver_type(
+        source: &str,
+        call_line: u32,
+        receiver_name: &str,
+        enclosing_impl: Option<&str>,
+    ) -> (Option<String>, Confidence) {
+        if matches!(receiver_name, "self" | "&self" | "&mut self" | "Self") {
+            if let Some(impl_type) = enclosing_impl {
+                return (Some(impl_type.to_string()), Confidence::High);
+            }
+            if let Some(impl_type) = naive_enclosing_impl(source, call_line) {
+                return (Some(impl_type), Confidence::High);
+            }
+            return (None, Confidence::Low);
+        }
+        let checks: [fn(&str, &str) -> Option<String>; 3] = [
+            rust_annotation_in_line,
+            rust_associated_function_in_line,
+            rust_struct_literal_in_line,
+        ];
+        for check in checks {
+            let lines: Vec<&str> = source.lines().collect();
+            let mut found = None;
+            for line_num in (0..call_line as usize).rev() {
+                // The old helpers returned None from `lines.get(line_num)?`.
+                let line = match lines.get(line_num) {
+                    Some(l) => l.trim(),
+                    None => break,
+                };
+                if let Some(t) = check(line, receiver_name) {
+                    found = Some(t);
+                    break;
+                }
+            }
+            if let Some(t) = found {
+                return (Some(t), Confidence::High);
+            }
+        }
+        (None, Confidence::Low)
+    }
+
+    fn naive_enclosing_impl(source: &str, line: u32) -> Option<String> {
+        let mut current_impl: Option<(String, i32)> = None;
+        let mut brace_depth: i32 = 0;
+        for (line_num, line_content) in source.lines().enumerate() {
+            let current_line = (line_num + 1) as u32;
+            let trimmed = line_content.trim();
+            brace_depth += line_content.matches('{').count() as i32;
+            brace_depth -= line_content.matches('}').count() as i32;
+            if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+                if let Some(impl_type) = extract_rust_impl_type(trimmed) {
+                    current_impl = Some((impl_type, brace_depth));
+                }
+            }
+            if current_line == line {
+                if let Some((ref impl_type, start_depth)) = current_impl {
+                    if brace_depth >= start_depth {
+                        return Some(impl_type.clone());
+                    }
+                }
+            }
+            if let Some((_, start_depth)) = &current_impl {
+                if brace_depth < *start_depth {
+                    current_impl = None;
+                }
+            }
+        }
+        None
+    }
+
+    fn assert_index_matches_scan(source: &str, line_step: usize, max_receivers: usize) {
+        let mut receivers: Vec<String> = ["self", "&self", "&mut self", "Self", "", "mut", "x", "(a)", "a.b", "dog"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for line in source.lines() {
+            for (at, _) in line.match_indices("let ") {
+                let rest = line[at + 4..].trim_start_matches("mut ");
+                let ident = leading_ident(rest);
+                if !ident.is_empty() && !receivers.iter().any(|r| r == ident) {
+                    receivers.push(ident.to_string());
+                }
+            }
+        }
+        receivers.truncate(max_receivers);
+        let index = RustSourceIndex::new(source);
+        let total = source.lines().count() as u32;
+        for call_line in (0..=total + 2).step_by(line_step) {
+            for receiver in &receivers {
+                for enclosing in [None, Some("Outer")] {
+                    assert_eq!(
+                        index.resolve(call_line, receiver, enclosing),
+                        naive_rust_receiver_type(source, call_line, receiver, enclosing),
+                        "line {call_line}, receiver {receiver:?}, enclosing {enclosing:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rust_index_matches_scan_on_tricky_source() {
+        let source = r#"
+impl<T: Clone> Wrapper<T> {
+    fn get(&self) -> T {
+        let x: Box<Thing> = Box::new(Thing {});
+        let mut y = Other { a: 1 };   let z = Self::new();
+        let outlet x: Fake = 1;
+        let a.b: Weird = 2;
+        let (a) = Tuple::new();
+        self.value.clone()
+    }
+}
+fn free() {
+    let mut x = Thing::default();
+    let x = Plain;
+    let dog = Dog { name: "Buddy" };
+    let mut dog: Dog = make();
+    x.go();
+}
+impl Display for Thing { fn fmt(&self) { self.x(); } }
+let_x
+"#;
+        assert_index_matches_scan(source, 1, usize::MAX);
+    }
+
+    #[test]
+    fn test_rust_index_matches_scan_on_real_files() {
+        for source in [
+            include_str!("builder_v2.rs"),
+            include_str!("resolution.rs"),
+        ] {
+            assert_index_matches_scan(source, 41, 25);
+        }
     }
 }

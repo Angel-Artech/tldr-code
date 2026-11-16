@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::cross_file_types::{CallSite, CallType, ClassDef, FileIR, FuncDef, VarType};
 use super::import_resolver::{ReExportTracer, DEFAULT_MAX_DEPTH};
-use super::type_resolver::resolve_receiver_type;
+use super::type_resolver::{resolve_receiver_type, RustSourceIndex};
 use crate::types::Language;
 
 // From new sibling modules:
@@ -276,6 +276,9 @@ pub fn apply_type_resolution(file_ir: &mut FileIR, source: &str, language: Langu
             | Language::Ocaml
     );
 
+    // Rust resolution scans the file for each call site, so index the file once.
+    let rust_index = matches!(language, Language::Rust).then(|| RustSourceIndex::new(source));
+
     // FM-10 fix: borrow var_types immutably alongside mutable calls borrow
     let (funcs, classes, var_types, calls) = (
         &file_ir.funcs,
@@ -317,13 +320,16 @@ pub fn apply_type_resolution(file_ir: &mut FileIR, source: &str, language: Langu
                 .and_then(|class_name| first_base_for_class(classes, class_name));
 
             if supports_type_resolution {
-                let (resolved, confidence) = resolve_receiver_type(
-                    language,
-                    source,
-                    line,
-                    receiver_key,
-                    enclosing_class.as_deref(),
-                );
+                let (resolved, confidence) = match &rust_index {
+                    Some(index) => index.resolve(line, receiver_key, enclosing_class.as_deref()),
+                    None => resolve_receiver_type(
+                        language,
+                        source,
+                        line,
+                        receiver_key,
+                        enclosing_class.as_deref(),
+                    ),
+                };
                 if resolved.is_some() && confidence != crate::types::Confidence::Low {
                     call_site.receiver_type = resolved;
                     continue;
